@@ -6,6 +6,7 @@
  *   GEMINI_API_KEY  : API key Gemini (bắt buộc)
  *   ALLOWED_ORIGIN  : domain trang web, vd https://net7-campus.page.gd  (nhiều domain cách nhau bằng dấu phẩy; * = cho tất cả)
  *   GEMINI_MODEL    : tùy chọn, mặc định gemini-flash-latest
+ *   THINKING_LEVEL  : tùy chọn, cho model Gemini 3.x: minimal | low | medium | high (thấp hơn = trả lời nhanh hơn)
  *   DEBUG           : tùy chọn, đặt 1 để xem lý do lỗi 502, xong thì xóa đi
  */
 
@@ -81,24 +82,39 @@ module.exports = async (req, res) => {
   const model = process.env.GEMINI_MODEL || 'gemini-flash-latest';
   const gen = { temperature: 0.5, maxOutputTokens: 2048 };
   if (/2\.5-flash/.test(model)) gen.thinkingConfig = { thinkingBudget: 0 };
+  else if (process.env.THINKING_LEVEL) gen.thinkingConfig = { thinkingLevel: process.env.THINKING_LEVEL };
+
+  const call = (g) => fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key },
+    body: JSON.stringify({ systemInstruction: { parts: [{ text: SYSTEM }] }, contents, generationConfig: g }),
+    signal: AbortSignal.timeout(25000), // không để người dùng chờ vô hạn
+  });
 
   let r;
   try {
-    r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key },
-      body: JSON.stringify({ systemInstruction: { parts: [{ text: SYSTEM }] }, contents, generationConfig: gen }),
-    });
-  } catch { return send(res, 502, { error: 'upstream_unreachable' }, cors); }
+    r = await call(gen);
+    // Nếu model không hỗ trợ tùy chọn thinking thì thử lại không kèm tùy chọn đó
+    if (r.status === 400 && gen.thinkingConfig) {
+      const g2 = { ...gen }; delete g2.thinkingConfig;
+      r = await call(g2);
+    }
+  } catch (e) {
+    if (e && (e.name === 'TimeoutError' || e.name === 'AbortError')) return send(res, 504, { error: 'timeout' }, cors);
+    return send(res, 502, { error: 'upstream_unreachable' }, cors);
+  }
 
   if (r.status === 429) return send(res, 429, { error: 'quota' }, cors);
   if (!r.ok) {
+    const detail = (await r.text().catch(() => '')).slice(0, 500);
+    // Luôn ghi vào Vercel → Logs (chỉ chủ dự án xem được), không phụ thuộc biến DEBUG
+    console.error('GEMINI_ERROR', JSON.stringify({ model, status: r.status, region: process.env.VERCEL_REGION, detail }));
     const out = { error: 'upstream_error' };
-    if (process.env.DEBUG === '1') {
+    if (String(process.env.DEBUG || '').trim() === '1') {
       out.model = model;
       out.status = r.status;
       out.region = process.env.VERCEL_REGION; // vùng đang chạy hàm, vd iad1
-      out.detail = (await r.text().catch(() => '')).slice(0, 500);
+      out.detail = detail;
     }
     return send(res, 502, out, cors);
   }
